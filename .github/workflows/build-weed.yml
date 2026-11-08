@@ -251,7 +251,7 @@ jobs:
             (S3 @('s3api','put-object','--bucket','gate','--key',$key,'--body',"$g\garbage.bin")) | Out-Null
             $o = & $d extract -s $store "$g\obj.caibx" "$g\ext2.bin" 2>&1 | Out-String
             Check '6 control: corrupted chunk makes extract fail' ($LASTEXITCODE -ne 0) $o
-          }
+
             # 7. fdbbackup to file://, restore into a second cluster, compare the key
             New-Item -ItemType Directory -Force "$g\backupdest", "$g\data2", "$g\logs2" | Out-Null
             $procs.agent = Start-Process "$g\backup_agent.exe" -ArgumentList '-C',"$g\fdb.cluster" -PassThru -WindowStyle Hidden
@@ -272,7 +272,7 @@ jobs:
             $restored = & "$g\fdbcli.exe" -C "$g\fdb2.cluster" --timeout 20 --exec 'get gatekey' 2>&1 | Out-String
             Check '7 restored key matches' ($restored -match 'gatevalue') $restored
             Check '7 control: backup dest is separate from the live cluster, not the FDB under test' (Test-Path "$g\backupdest") "dest=$dest"
-
+          }
           finally {
             Stop-P 'weed'; Stop-P 'fdb'
             Stop-P 'fdb2'
