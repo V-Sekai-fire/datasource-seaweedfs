@@ -249,7 +249,10 @@ jobs:
             $sum | Set-Content "$g\summary.txt"
             "### Gate`n" + (($sum | ForEach-Object { "- $_" }) -join "`n") | Add-Content $env:GITHUB_STEP_SUMMARY
           }
-          if ($results.Count -eq 0 -or $results.Values -contains $false) { exit 1 }
+          $failed = @($results.Keys | Where-Object { -not $results[$_] }).Count
+          "checks: $($results.Count), failed: $failed"
+          if ($results.Count -lt 18 -or $failed -gt 0) { exit 1 }
+          exit 0
 
       - if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
