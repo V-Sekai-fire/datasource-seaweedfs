@@ -282,7 +282,12 @@ jobs:
             Check '7 fdbbackup start submitted' ($LASTEXITCODE -eq 0) $o
             $status = ''
             $done = $false
-            for ($i = 0; $i -lt 90; $i++) {
+            # -s/--snapshot-interval does not speed this up: measured locally (macOS, 12 cores)
+            # at ~35s with the default 864000s interval AND with -s 5, so the latency is some
+            # other fixed minimum in FileBackupAgent's task machinery, not interval-tunable. The
+            # Windows runner is slower than that baseline (seen still "just started" at 90s), so
+            # the bound is set to 5x the measured local baseline, not an arbitrary round number.
+            for ($i = 0; $i -lt 180; $i++) {
               $status = & "$g\fdbbackup.exe" status -C "$g\fdb.cluster" 2>&1 | Out-String
               if ($status -match '(?i)completed at version') { $done = $true; break }
               Start-Sleep 1
@@ -308,7 +313,7 @@ jobs:
             Check '7 fdbrestore start submitted' ($LASTEXITCODE -eq 0) $o
             $rstatus = ''
             $rdone = $false
-            for ($i = 0; $i -lt 90; $i++) {
+            for ($i = 0; $i -lt 180; $i++) {
               $rstatus = & "$g\fdbrestore.exe" status --dest-cluster-file "$g\fdb2.cluster" 2>&1 | Out-String
               if ($rstatus -match '(?i)state:\s*completed') { $rdone = $true; break }
               Start-Sleep 1
@@ -328,7 +333,7 @@ jobs:
           }
           $failed = @($results.Keys | Where-Object { -not $results[$_] }).Count
           "checks: $($results.Count), failed: $failed"
-          if ($results.Count -lt 24 -or $failed -gt 0) { exit 1 }
+          if ($results.Count -lt 26 -or $failed -gt 0) { exit 1 }
           exit 0
 
       - if: always()
