@@ -46,7 +46,9 @@ jobs:
           curl.exe -sSfL -o winfsp.msi $env:WINFSP_URL
           if ((Get-FileHash winfsp.msi -Algorithm SHA256).Hash.ToLower() -ne $env:WINFSP_SHA256) { throw 'winfsp sha256 mismatch' }
           Start-Process msiexec -ArgumentList '/i',"$PWD\winfsp.msi",'/qn','INSTALLLEVEL=1000' -Wait
-          if (-not (Test-Path 'C:\Program Files (x86)\WinFsp\inc\fuse\fuse_common.h')) { throw 'fuse_common.h missing' }
+          # Copy the headers to a path without spaces: cgo splits CGO_CFLAGS on spaces.
+          Copy-Item 'C:\Program Files (x86)\WinFsp\inc\fuse' "$PWD\winfsp-inc" -Recurse
+          if (-not (Test-Path "$PWD\winfsp-inc\fuse_common.h")) { throw 'fuse_common.h missing' }
 
       - name: Fetch llvm-mingw
         shell: pwsh
@@ -64,7 +66,7 @@ jobs:
           $lib = "$root\msi\PFiles\foundationdb\lib\foundationdb"
           $env:CGO_ENABLED = '1'
           $env:CC = 'x86_64-w64-mingw32-clang'
-          $env:CGO_CFLAGS = "-I$inc -I`"C:\Program Files (x86)\WinFsp\inc\fuse`""
+          $env:CGO_CFLAGS = "-I$inc -I$root\winfsp-inc"
           $env:CGO_LDFLAGS = "-L$lib -lfdb_c"
           go build -tags foundationdb -o weed.exe ./weed
           if ($LASTEXITCODE -ne 0) {
