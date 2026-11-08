@@ -161,6 +161,25 @@ jobs:
           if ((Sha "$g\desync.zip") -ne '114a18e415842d939fc3578e7f486f06d78ce536379bb2b6320879baa4c4e80e') { throw 'desync sha256 mismatch' }
           Expand-Archive "$g\desync.zip" "$g\desync"
 
+          # Section 7's backup_agent connections to the restarted fdbserver were torn down every
+          # ~1s on the Windows runner (trace: ConnectionFrom -> immediate ConnectionClosed,
+          # Error=connection_failed "Network connection failed"; zero BackupWorkerDoneRequests the
+          # whole run), while fdbcli's own connections to the same server worked fine throughout
+          # stages 5-6. That selectivity (fdbserver.exe/fdbcli.exe already running and unaffected;
+          # a newly-introduced binary's connections specifically reset) points at Defender or the
+          # firewall, not FDB itself. Exclude and allow every FDB/weed binary before any of them
+          # run. Best-effort: hosted runners sometimes block Defender tamper-protected cmdlets, so
+          # a failure here is logged, not fatal -- it would just leave the original symptom.
+          foreach ($exe in 'fdbserver.exe','fdbcli.exe','fdbbackup.exe','backup_agent.exe','fdbrestore.exe','weed.exe') {
+            $full = "$g\$exe"
+            try { Add-MpPreference -ExclusionProcess $full -ErrorAction Stop } catch { "note: Defender process exclusion failed for $exe`: $_" }
+            try {
+              New-NetFirewallRule -DisplayName "gate-$exe-in" -Direction Inbound -Program $full -Action Allow -Protocol TCP -ErrorAction Stop | Out-Null
+              New-NetFirewallRule -DisplayName "gate-$exe-out" -Direction Outbound -Program $full -Action Allow -Protocol TCP -ErrorAction Stop | Out-Null
+            } catch { "note: firewall rule failed for $exe`: $_" }
+          }
+          try { Add-MpPreference -ExclusionPath $g -ErrorAction Stop } catch { "note: Defender path exclusion failed: $_" }
+
           $procs = @{}
           function Start-Fdb { $procs.fdb = Start-Process "$g\fdbserver.exe" -ArgumentList '-C',"$g\fdb.cluster",'-p','127.0.0.1:4500','-d',"$g\data",'-L',"$g\logs" -PassThru -WindowStyle Hidden }
           function Fdbcli($c) { & "$g\fdbcli.exe" -C "$g\fdb.cluster" --timeout 20 --exec $c 2>&1 | Out-String }
@@ -282,7 +301,12 @@ jobs:
             Check '7 fdbbackup start submitted' ($LASTEXITCODE -eq 0) $o
             $status = ''
             $done = $false
-            for ($i = 0; $i -lt 90; $i++) {
+            # -s/--snapshot-interval does not speed this up: measured locally (macOS, 12 cores)
+            # at ~35s with the default 864000s interval AND with -s 5, so the latency is some
+            # other fixed minimum in FileBackupAgent's task machinery, not interval-tunable. The
+            # Windows runner is slower than that baseline (seen still "just started" at 90s), so
+            # the bound is set to 5x the measured local baseline, not an arbitrary round number.
+            for ($i = 0; $i -lt 180; $i++) {
               $status = & "$g\fdbbackup.exe" status -C "$g\fdb.cluster" 2>&1 | Out-String
               if ($status -match '(?i)completed at version') { $done = $true; break }
               Start-Sleep 1
@@ -308,7 +332,7 @@ jobs:
             Check '7 fdbrestore start submitted' ($LASTEXITCODE -eq 0) $o
             $rstatus = ''
             $rdone = $false
-            for ($i = 0; $i -lt 90; $i++) {
+            for ($i = 0; $i -lt 180; $i++) {
               $rstatus = & "$g\fdbrestore.exe" status --dest-cluster-file "$g\fdb2.cluster" 2>&1 | Out-String
               if ($rstatus -match '(?i)state:\s*completed') { $rdone = $true; break }
               Start-Sleep 1
@@ -328,7 +352,7 @@ jobs:
           }
           $failed = @($results.Keys | Where-Object { -not $results[$_] }).Count
           "checks: $($results.Count), failed: $failed"
-          if ($results.Count -lt 24 -or $failed -gt 0) { exit 1 }
+          if ($results.Count -lt 26 -or $failed -gt 0) { exit 1 }
           exit 0
 
       - if: always()
