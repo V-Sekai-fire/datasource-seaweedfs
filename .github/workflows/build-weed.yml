@@ -139,6 +139,9 @@ jobs:
           function Sha($f) { (Get-FileHash $f -Algorithm SHA256).Hash.ToLower() }
 
           # --- inputs, each checked by sha256
+          foreach ($f in 'fdbbackup.windows.x86_64.exe','backup_agent.windows.x86_64.exe','fdbrestore.windows.x86_64.exe') {
+            curl.exe -sSfL -o "$g\$f" "$b/$f"
+          }
           Copy-Item weed-art\weed.windows.x86_64.exe "$g\weed.exe"
           $b = "https://github.com/V-Sekai-fire/datasource-foundationdb/releases/download/$env:FDB_TAG"
           foreach ($f in 'SHA256SUMS.windows','fdbserver.windows.x86_64.exe','fdbcli.windows.x86_64.exe','fdb_c.windows.x86_64.dll') { curl.exe -sSfL -o "$g\$f" "$b/$f" }
@@ -148,6 +151,12 @@ jobs:
           }
           Move-Item "$g\fdbserver.windows.x86_64.exe" "$g\fdbserver.exe"
           Move-Item "$g\fdbcli.windows.x86_64.exe" "$g\fdbcli.exe"
+          foreach ($p in 'fdbbackup','backup_agent','fdbrestore') {
+            if (Test-Path "$g\$p.windows.x86_64.exe") {
+              if ((Sha "$g\$p.windows.x86_64.exe") -ne ((Get-Content "$g\SHA256SUMS.windows" | Select-String "$p.windows.x86_64.exe$").Line -split ' ')[0]) { throw "sha256 mismatch: $p" }
+              Move-Item "$g\$p.windows.x86_64.exe" "$g\$p.exe"
+            }
+          }
           Move-Item "$g\fdb_c.windows.x86_64.dll" "$g\fdb_c.dll"
           curl.exe -sSfL -o "$g\desync.zip" https://github.com/folbricht/desync/releases/download/v1.1.5/desync_1.1.5_windows_amd64.zip
           if ((Sha "$g\desync.zip") -ne '114a18e415842d939fc3578e7f486f06d78ce536379bb2b6320879baa4c4e80e') { throw 'desync sha256 mismatch' }
@@ -243,15 +252,37 @@ jobs:
             $o = & $d extract -s $store "$g\obj.caibx" "$g\ext2.bin" 2>&1 | Out-String
             Check '6 control: corrupted chunk makes extract fail' ($LASTEXITCODE -ne 0) $o
           }
+            # 7. fdbbackup to file://, restore into a second cluster, compare the key
+            New-Item -ItemType Directory -Force "$g\backupdest", "$g\data2", "$g\logs2" | Out-Null
+            $procs.agent = Start-Process "$g\backup_agent.exe" -ArgumentList '-C',"$g\fdb.cluster" -PassThru -WindowStyle Hidden
+            Start-Sleep 2
+            $dest = "file://" + ($g -replace '\\','/') + "/backupdest"
+            $o = & "$g\fdbbackup.exe" start -C "$g\fdb.cluster" -d $dest -w 2>&1 | Out-String
+            Check '7 fdbbackup completes' ($LASTEXITCODE -eq 0) $o
+            $status = & "$g\fdbbackup.exe" status -C "$g\fdb.cluster" -d $dest 2>&1 | Out-String
+            Check '7 fdbbackup status reports completed' ($status -match '(?i)completed') $status
+            Stop-P 'agent'
+            'second:second@127.0.0.1:4501' | Set-Content "$g\fdb2.cluster" -NoNewline
+            $procs.fdb2 = Start-Process "$g\fdbserver.exe" -ArgumentList '-C',"$g\fdb2.cluster",'-p','127.0.0.1:4501','-d',"$g\data2",'-L',"$g\logs2" -PassThru -WindowStyle Hidden
+            Start-Sleep 3
+            (& "$g\fdbcli.exe" -C "$g\fdb2.cluster" --timeout 20 --exec 'configure new single memory') | Out-Null
+            Check '7 second fdb available' ((Wait-Until { (& "$g\fdbcli.exe" -C "$g\fdb2.cluster" --timeout 10 --exec 'status minimal' 2>&1 | Out-String) -match 'available' } 60))
+            $o = & "$g\fdbrestore.exe" start -C "$g\fdb2.cluster" -r $dest -w 2>&1 | Out-String
+            Check '7 fdbrestore completes' ($LASTEXITCODE -eq 0) $o
+            $restored = & "$g\fdbcli.exe" -C "$g\fdb2.cluster" --timeout 20 --exec 'get gatekey' 2>&1 | Out-String
+            Check '7 restored key matches' ($restored -match 'gatevalue') $restored
+            Check '7 control: backup dest is separate from the live cluster, not the FDB under test' (Test-Path "$g\backupdest") "dest=$dest"
+
           finally {
             Stop-P 'weed'; Stop-P 'fdb'
+            Stop-P 'fdb2'
             $sum = $results.GetEnumerator() | ForEach-Object { "{0} {1}" -f $(if ($_.Value) { 'PASS' } else { 'FAIL' }), $_.Key }
             $sum | Set-Content "$g\summary.txt"
             "### Gate`n" + (($sum | ForEach-Object { "- $_" }) -join "`n") | Add-Content $env:GITHUB_STEP_SUMMARY
           }
           $failed = @($results.Keys | Where-Object { -not $results[$_] }).Count
           "checks: $($results.Count), failed: $failed"
-          if ($results.Count -lt 18 -or $failed -gt 0) { exit 1 }
+          if ($results.Count -lt 22 -or $failed -gt 0) { exit 1 }
           exit 0
 
       - if: always()
@@ -264,3 +295,4 @@ jobs:
             gate/*.err
             gate/filer.toml
             gate/logs/**
+            gate/logs2/**
