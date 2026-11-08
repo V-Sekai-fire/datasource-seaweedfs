@@ -139,6 +139,10 @@ jobs:
           function Sha($f) { (Get-FileHash $f -Algorithm SHA256).Hash.ToLower() }
 
           # --- inputs, each checked by sha256
+          Copy-Item weed-art\weed.windows.x86_64.exe "$g\weed.exe"
+          $b = "https://github.com/V-Sekai-fire/datasource-foundationdb/releases/download/$env:FDB_TAG"
+          foreach ($f in 'SHA256SUMS.windows','fdbserver.windows.x86_64.exe','fdbcli.windows.x86_64.exe','fdb_c.windows.x86_64.dll') { curl.exe -sSfL -o "$g\$f" "$b/$f" }
+
           # fdbbackup/backup_agent/fdbrestore are not loose release assets; they live only inside the MSI.
           curl.exe -sSfL -o "$g\fdb.msi" "$b/foundationdb-7.3.79-SNAPSHOT-x64.msi"
           if ((Sha "$g\fdb.msi") -ne ((Get-Content "$g\SHA256SUMS.windows" | Select-String 'foundationdb-7\.3\.79-SNAPSHOT-x64\.msi$').Line -split ' ')[0]) { throw 'sha256 mismatch: foundationdb-7.3.79-SNAPSHOT-x64.msi' }
@@ -146,9 +150,6 @@ jobs:
           foreach ($p in 'fdbbackup','backup_agent','fdbrestore') {
             Copy-Item "$g\msi\PFiles\foundationdb\bin\$p.exe" "$g\$p.exe"
           }
-          Copy-Item weed-art\weed.windows.x86_64.exe "$g\weed.exe"
-          $b = "https://github.com/V-Sekai-fire/datasource-foundationdb/releases/download/$env:FDB_TAG"
-          foreach ($f in 'SHA256SUMS.windows','fdbserver.windows.x86_64.exe','fdbcli.windows.x86_64.exe','fdb_c.windows.x86_64.dll') { curl.exe -sSfL -o "$g\$f" "$b/$f" }
           foreach ($l in Get-Content "$g\SHA256SUMS.windows") {
             $h, $n = $l -split ' \*', 2
             if ((Test-Path "$g\$n") -and ((Sha "$g\$n") -ne $h)) { throw "sha256 mismatch: $n" }
