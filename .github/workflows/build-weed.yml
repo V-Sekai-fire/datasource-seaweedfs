@@ -233,8 +233,12 @@ jobs:
             Start-Weed
             Check '5 weed back up after restart' (Weed-Up)
             Remove-Item "$g\back.bin" -ErrorAction SilentlyContinue
-            $r = S3 @('s3api','get-object','--bucket','gate','--key','obj8m',"$g\back.bin")
-            Check '5 get after restart sha256 matches' ($r.Code -eq 0 -and (Sha "$g\back.bin") -eq $want)
+            $ok2 = Wait-Until {
+              Remove-Item "$g\back.bin" -ErrorAction SilentlyContinue
+              $r = S3 @('s3api','get-object','--bucket','gate','--key','obj8m',"$g\back.bin")
+              $r.Code -eq 0 -and (Test-Path "$g\back.bin") -and (Sha "$g\back.bin") -eq $want
+            } 20
+            Check '5 get after restart sha256 matches' $ok2 $r.Out
 
             # 6. desync through the S3 gateway
             $env:S3_ACCESS_KEY = 'gatekey'; $env:S3_SECRET_KEY = 'gatesecret'; $env:S3_REGION = 'us-east-1'
@@ -255,10 +259,10 @@ jobs:
             New-Item -ItemType Directory -Force "$g\backupdest", "$g\data2", "$g\logs2" | Out-Null
             $procs.agent = Start-Process "$g\backup_agent.exe" -ArgumentList '-C',"$g\fdb.cluster" -PassThru -WindowStyle Hidden
             Start-Sleep 2
-            $dest = "file://" + ($g -replace '\\','/') + "/backupdest"
+            $dest = "file://" + "$g\backupdest"
             $o = & "$g\fdbbackup.exe" start -C "$g\fdb.cluster" -d $dest -w 2>&1 | Out-String
             Check '7 fdbbackup completes' ($LASTEXITCODE -eq 0) $o
-            $status = & "$g\fdbbackup.exe" status -C "$g\fdb.cluster" -d $dest 2>&1 | Out-String
+            $status = & "$g\fdbbackup.exe" status -C "$g\fdb.cluster" 2>&1 | Out-String
             Check '7 fdbbackup status reports completed' ($status -match '(?i)completed') $status
             Stop-P 'agent'
             'second:second@127.0.0.1:4501' | Set-Content "$g\fdb2.cluster" -NoNewline
@@ -266,7 +270,7 @@ jobs:
             Start-Sleep 3
             (& "$g\fdbcli.exe" -C "$g\fdb2.cluster" --timeout 20 --exec 'configure new single memory') | Out-Null
             Check '7 second fdb available' ((Wait-Until { (& "$g\fdbcli.exe" -C "$g\fdb2.cluster" --timeout 10 --exec 'status minimal' 2>&1 | Out-String) -match 'available' } 60))
-            $o = & "$g\fdbrestore.exe" start -C "$g\fdb2.cluster" -r $dest -w 2>&1 | Out-String
+            $o = & "$g\fdbrestore.exe" start --dest-cluster-file "$g\fdb2.cluster" -r $dest -w 2>&1 | Out-String
             Check '7 fdbrestore completes' ($LASTEXITCODE -eq 0) $o
             $restored = & "$g\fdbcli.exe" -C "$g\fdb2.cluster" --timeout 20 --exec 'get gatekey' 2>&1 | Out-String
             Check '7 restored key matches' ($restored -match 'gatevalue') $restored
