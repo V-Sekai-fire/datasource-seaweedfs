@@ -91,6 +91,7 @@ jobs:
           'fdb_c.dll imported'
           # control: a build without the tag must not import it
           $env:CGO_ENABLED = '1'; $env:CC = 'x86_64-w64-mingw32-clang'
+          $env:CGO_CFLAGS = "-I$PWD\winfsp-inc"
           go build -o weed-notag.exe ./weed
           $ctl = llvm-readobj --coff-imports weed-notag.exe | Out-String
           if ($ctl -match 'fdb_c\.dll') { throw 'control failed: untagged build imports fdb_c.dll' }
@@ -108,3 +109,155 @@ jobs:
           path: |
             weed.windows.x86_64.exe
             SHA256SUMS
+
+  # The one CPU integration job (operator exception, 2026-11-08): FDB 7.3 + weed + S3 + restart + desync.
+  gate:
+    needs: windows
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: weed-windows-x86_64
+          path: weed-art
+
+      - name: Gate
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $g = "$PWD\gate"; New-Item -ItemType Directory -Force $g, "$g\data", "$g\logs", "$g\vol" | Out-Null
+          $results = [ordered]@{}
+          function Check($name, [bool]$ok, $detail = '') {
+            $results[$name] = $ok
+            "{0} {1} {2}" -f $(if ($ok) { 'PASS' } else { 'FAIL' }), $name, $detail
+          }
+          function Wait-Until([scriptblock]$t, [int]$s) {
+            $end = (Get-Date).AddSeconds($s)
+            while ((Get-Date) -lt $end) { if (& $t) { return $true }; Start-Sleep 1 }
+            return $false
+          }
+          function Sha($f) { (Get-FileHash $f -Algorithm SHA256).Hash.ToLower() }
+
+          # --- inputs, each checked by sha256
+          Copy-Item weed-art\weed.windows.x86_64.exe "$g\weed.exe"
+          $b = "https://github.com/V-Sekai-fire/datasource-foundationdb/releases/download/$env:FDB_TAG"
+          foreach ($f in 'SHA256SUMS.windows','fdbserver.windows.x86_64.exe','fdbcli.windows.x86_64.exe','fdb_c.windows.x86_64.dll') { curl.exe -sSfL -o "$g\$f" "$b/$f" }
+          foreach ($l in Get-Content "$g\SHA256SUMS.windows") {
+            $h, $n = $l -split ' \*', 2
+            if ((Test-Path "$g\$n") -and ((Sha "$g\$n") -ne $h)) { throw "sha256 mismatch: $n" }
+          }
+          Move-Item "$g\fdbserver.windows.x86_64.exe" "$g\fdbserver.exe"
+          Move-Item "$g\fdbcli.windows.x86_64.exe" "$g\fdbcli.exe"
+          Move-Item "$g\fdb_c.windows.x86_64.dll" "$g\fdb_c.dll"
+          curl.exe -sSfL -o "$g\desync.zip" https://github.com/folbricht/desync/releases/download/v1.1.5/desync_1.1.5_windows_amd64.zip
+          if ((Sha "$g\desync.zip") -ne '114a18e415842d939fc3578e7f486f06d78ce536379bb2b6320879baa4c4e80e') { throw 'desync sha256 mismatch' }
+          Expand-Archive "$g\desync.zip" "$g\desync"
+
+          $procs = @{}
+          function Start-Fdb { $procs.fdb = Start-Process "$g\fdbserver.exe" -ArgumentList '-C',"$g\fdb.cluster",'-p','127.0.0.1:4500','-d',"$g\data",'-L',"$g\logs" -PassThru -WindowStyle Hidden }
+          function Fdbcli($c) { & "$g\fdbcli.exe" -C "$g\fdb.cluster" --timeout 20 --exec $c 2>&1 | Out-String }
+          function Fdb-Up { Wait-Until { (Fdbcli 'status minimal') -match 'available' } 60 }
+          function Key-Count { $o = (Fdbcli 'getrangekeys \x00 \xff 10000') -split "`n"; @($o | Where-Object { $_ -match '^`' }).Count }
+          $toml = "$g\filer.toml"
+          function Write-Toml($ver) {
+            $cf = $g -replace '\\','/'
+            "[leveldb2]`nenabled = false`n[foundationdb]`nenabled = true`ncluster_file = `"$cf/fdb.cluster`"`napi_version = $ver`ntimeout = `"5s`"`ndirectory_prefix = `"seaweedfs`"`n" | Set-Content $toml -NoNewline
+          }
+          $script:n = 0
+          function Start-Weed { $script:n++; $procs.weed = Start-Process "$g\weed.exe" -ArgumentList 'server','-ip=127.0.0.1','-dir=vol','-master.volumeSizeLimitMB=128','-volume.max=8','-filer','-s3','-s3.config=s3.json' -WorkingDirectory $g -RedirectStandardOutput "$g\weed$($script:n).out" -RedirectStandardError "$g\weed$($script:n).err" -PassThru -WindowStyle Hidden }
+          function Weed-Up { Wait-Until { (curl.exe -s -o NUL -w '%{http_code}' http://127.0.0.1:8888/) -eq '200' -and (curl.exe -s -o NUL -w '%{http_code}' http://127.0.0.1:8333/) -ne '000' } 90 }
+          function Stop-P($k) { if ($procs[$k] -and -not $procs[$k].HasExited) { Stop-Process -Id $procs[$k].Id -Force }; Start-Sleep 2 }
+
+          $env:AWS_ACCESS_KEY_ID = 'gatekey'; $env:AWS_SECRET_ACCESS_KEY = 'gatesecret'; $env:AWS_DEFAULT_REGION = 'us-east-1'
+          $env:AWS_REQUEST_CHECKSUM_CALCULATION = 'when_required'; $env:AWS_RESPONSE_CHECKSUM_VALIDATION = 'when_required'
+          $env:AWS_MAX_ATTEMPTS = '1'; $env:AWS_EC2_METADATA_DISABLED = 'true'
+          $ep = 'http://127.0.0.1:8333'
+          function S3($a) { $o = & aws --endpoint-url $ep --cli-connect-timeout 5 --cli-read-timeout 25 @a 2>&1 | Out-String; [pscustomobject]@{ Code = $LASTEXITCODE; Out = $o } }
+          '{"identities":[{"name":"gate","credentials":[{"accessKey":"gatekey","secretKey":"gatesecret"}],"actions":["Admin","Read","Write","List","Tagging"]}]}' | Set-Content "$g\s3.json"
+
+          try {
+            # 1. FDB alive
+            'gate:gate@127.0.0.1:4500' | Set-Content "$g\fdb.cluster" -NoNewline
+            Start-Fdb; Start-Sleep 3
+            (Fdbcli 'configure new single memory') | Out-Null
+            Check '1 fdb available' (Fdb-Up)
+            (Fdbcli 'writemode on; set gatekey gatevalue') | Out-Null
+            Check '1 fdb key roundtrip' ((Fdbcli 'get gatekey') -match 'gatevalue')
+
+            # 2. control first: api_version 740 must be refused by the 7.3 client
+            Write-Toml 740; Start-Weed
+            $exited = Wait-Until { $procs.weed.HasExited } 40
+            Check '2 control: api_version 740 refused' $exited ("exit=" + $(if ($exited) { $procs.weed.ExitCode } else { 'still running' }))
+            Stop-P 'weed'
+            Get-Content "$g\weed1.err" -Tail 5 -ErrorAction SilentlyContinue
+
+            # 2. store selection: api_version 730
+            Write-Toml 730; Start-Weed
+            Check '2 weed up on the FDB store' (Weed-Up)
+            Check '2 log names the foundationdb store' ((Get-Content "$g\weed2.out","$g\weed2.err" -ErrorAction SilentlyContinue | Out-String) -match '(?i)foundationdb')
+
+            # 3. metadata lands in FDB
+            $r = S3 @('s3api','create-bucket','--bucket','gate')
+            Check '4 create bucket' ($r.Code -eq 0) $r.Out
+            $before = Key-Count
+            $bytes = New-Object byte[] (8MB); [Security.Cryptography.RandomNumberGenerator]::Fill($bytes); [IO.File]::WriteAllBytes("$g\obj.bin", $bytes)
+            $want = Sha "$g\obj.bin"
+            $r = S3 @('s3api','put-object','--bucket','gate','--key','obj8m','--body',"$g\obj.bin")
+            Check '4 s3 put' ($r.Code -eq 0) $r.Out
+            $after = Key-Count
+            Check '3 fdb key count rose after the put' ($after -gt $before) "before=$before after=$after"
+
+            # 4. S3 round trip and controls
+            $r = S3 @('s3api','get-object','--bucket','gate','--key','obj8m',"$g\back.bin")
+            Check '4 s3 get sha256 matches' ($r.Code -eq 0 -and (Sha "$g\back.bin") -eq $want)
+            $env:AWS_SECRET_ACCESS_KEY = 'wrong'
+            $r = S3 @('s3api','list-objects-v2','--bucket','gate')
+            $env:AWS_SECRET_ACCESS_KEY = 'gatesecret'
+            Check '4 control: wrong secret refused' ($r.Code -ne 0 -and $r.Out -match '403|Forbidden|SignatureDoesNotMatch|AccessDenied')
+            Stop-P 'fdb'
+            $r = S3 @('s3api','put-object','--bucket','gate','--key','while-fdb-down','--body',"$g\obj.bin")
+            Check '4 control: put fails with fdbserver stopped' ($r.Code -ne 0)
+
+            # 5. restart both, same bytes
+            Stop-P 'weed'
+            Start-Fdb
+            Check '5 fdb back up after restart' (Fdb-Up)
+            Start-Weed
+            Check '5 weed back up after restart' (Weed-Up)
+            Remove-Item "$g\back.bin" -ErrorAction SilentlyContinue
+            $r = S3 @('s3api','get-object','--bucket','gate','--key','obj8m',"$g\back.bin")
+            Check '5 get after restart sha256 matches' ($r.Code -eq 0 -and (Sha "$g\back.bin") -eq $want)
+
+            # 6. desync through the S3 gateway
+            $env:S3_ACCESS_KEY = 'gatekey'; $env:S3_SECRET_KEY = 'gatesecret'; $env:S3_REGION = 'us-east-1'
+            $store = 's3+http://127.0.0.1:8333/gate/store'
+            $d = Get-ChildItem "$g\desync" -Recurse -Filter desync.exe | Select-Object -First 1 -ExpandProperty FullName
+            $o = & $d make -s $store "$g\obj.caibx" "$g\obj.bin" 2>&1 | Out-String
+            Check '6 desync make' ($LASTEXITCODE -eq 0) $o
+            $o = & $d extract -s $store "$g\obj.caibx" "$g\ext1.bin" 2>&1 | Out-String
+            Check '6 desync extract sha256 matches' ($LASTEXITCODE -eq 0 -and (Sha "$g\ext1.bin") -eq $want) $o
+            $key = (S3 @('s3api','list-objects-v2','--bucket','gate','--prefix','store/','--query','Contents[0].Key','--output','text')).Out.Trim()
+            Check '6 chunk object found' ($key -match 'cacnk') $key
+            [IO.File]::WriteAllBytes("$g\garbage.bin", (New-Object byte[] 4096))
+            (S3 @('s3api','put-object','--bucket','gate','--key',$key,'--body',"$g\garbage.bin")) | Out-Null
+            $o = & $d extract -s $store "$g\obj.caibx" "$g\ext2.bin" 2>&1 | Out-String
+            Check '6 control: corrupted chunk makes extract fail' ($LASTEXITCODE -ne 0) $o
+          }
+          finally {
+            Stop-P 'weed'; Stop-P 'fdb'
+            $sum = $results.GetEnumerator() | ForEach-Object { "{0} {1}" -f $(if ($_.Value) { 'PASS' } else { 'FAIL' }), $_.Key }
+            $sum | Set-Content "$g\summary.txt"
+            "### Gate`n" + (($sum | ForEach-Object { "- $_" }) -join "`n") | Add-Content $env:GITHUB_STEP_SUMMARY
+          }
+          if ($results.Count -eq 0 -or $results.Values -contains $false) { exit 1 }
+
+      - if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: gate-logs
+          path: |
+            gate/summary.txt
+            gate/*.out
+            gate/*.err
+            gate/filer.toml
+            gate/logs/**
