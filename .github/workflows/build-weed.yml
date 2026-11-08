@@ -255,8 +255,25 @@ jobs:
             $o = & $d extract -s $store "$g\obj.caibx" "$g\ext2.bin" 2>&1 | Out-String
             Check '6 control: corrupted chunk makes extract fail' ($LASTEXITCODE -ne 0) $o
 
-            # 7. fdbbackup to file://, restore into a second cluster, compare the key (poll, never -w: it can
-            # block forever with no output if backup_agent is not yet registered)
+            # 7. fdbbackup to file://, restore into a second cluster, compare the key.
+            #
+            # Three bugs found and fixed here by a local macOS repro against real fdbbackup/
+            # fdbrestore 7.3.82 binaries (datasource-foundationdb#17's fix is unrelated and
+            # unaffected -- this gate was never actually exercising it past this point):
+            #  (a) fdbbackup status's real completion text is "... completed at version N",
+            #      never the literal phrase "has completed" this used to grep for -- that
+            #      check was destined to time out on any OS, backup healthy or not.
+            #  (b) restore's -r needs the exact backup-<timestamp> sub-URL fdbbackup -d just
+            #      created, not the bare container path; passing the bare path fails restore
+            #      immediately ("not restorable to any version"), which Windows's buffered-I/O
+            #      error path reports as the far less legible "Disk i/o operation failed".
+            #  (c) a restore submitted to the destination cluster needs an agent running
+            #      against THAT cluster too, not only the source -- otherwise it sits queued
+            #      forever with CurrentVersion -1 and nothing ever picks it up.
+            # Also: the original Wait-Until-based polling assigned $status inside a scriptblock
+            # invoked via `& $t`, which does not propagate back to this scope in PowerShell, so
+            # Check always printed an empty detail line regardless of what fdbbackup actually
+            # said -- replaced with a plain inline loop so the diagnostic text is real.
             New-Item -ItemType Directory -Force "$g\backupdest", "$g\data2", "$g\logs2" | Out-Null
             $procs.agent = Start-Process "$g\backup_agent.exe" -ArgumentList '-C',"$g\fdb.cluster" -RedirectStandardOutput "$g\agent.out" -RedirectStandardError "$g\agent.err" -PassThru -WindowStyle Hidden
             Start-Sleep 5
@@ -264,19 +281,40 @@ jobs:
             $o = & "$g\fdbbackup.exe" start -C "$g\fdb.cluster" -d $dest 2>&1 | Out-String
             Check '7 fdbbackup start submitted' ($LASTEXITCODE -eq 0) $o
             $status = ''
-            $done = Wait-Until { $status = & "$g\fdbbackup.exe" status -C "$g\fdb.cluster" 2>&1 | Out-String; $status -match '(?i)has completed' } 90
+            $done = $false
+            for ($i = 0; $i -lt 90; $i++) {
+              $status = & "$g\fdbbackup.exe" status -C "$g\fdb.cluster" 2>&1 | Out-String
+              if ($status -match '(?i)completed at version') { $done = $true; break }
+              Start-Sleep 1
+            }
             Check '7 fdbbackup status reports completed' $done $status
+            if ($status -match 'BackupURL:\s*(\S+)') {
+              $backupUrl = $Matches[1]
+              Check '7 fdbbackup reported a BackupURL' $true $backupUrl
+            } else {
+              $backupUrl = $dest
+              Check '7 fdbbackup reported a BackupURL' $false $status
+            }
             Stop-P 'agent'
             'second:second@127.0.0.1:4501' | Set-Content "$g\fdb2.cluster" -NoNewline
             $procs.fdb2 = Start-Process "$g\fdbserver.exe" -ArgumentList '-C',"$g\fdb2.cluster",'-p','127.0.0.1:4501','-d',"$g\data2",'-L',"$g\logs2" -PassThru -WindowStyle Hidden
             Start-Sleep 3
             (& "$g\fdbcli.exe" -C "$g\fdb2.cluster" --timeout 20 --exec 'configure new single memory') | Out-Null
             Check '7 second fdb available' ((Wait-Until { (& "$g\fdbcli.exe" -C "$g\fdb2.cluster" --timeout 10 --exec 'status minimal' 2>&1 | Out-String) -match 'available' } 60))
-            $o = & "$g\fdbrestore.exe" start --dest-cluster-file "$g\fdb2.cluster" -r $dest 2>&1 | Out-String
+            # A restore agent against the DESTINATION cluster -- not the source one started above.
+            $procs.agent2 = Start-Process "$g\backup_agent.exe" -ArgumentList '-C',"$g\fdb2.cluster" -RedirectStandardOutput "$g\agent2.out" -RedirectStandardError "$g\agent2.err" -PassThru -WindowStyle Hidden
+            Start-Sleep 5
+            $o = & "$g\fdbrestore.exe" start --dest-cluster-file "$g\fdb2.cluster" -r $backupUrl 2>&1 | Out-String
             Check '7 fdbrestore start submitted' ($LASTEXITCODE -eq 0) $o
             $rstatus = ''
-            $rdone = Wait-Until { $rstatus = & "$g\fdbrestore.exe" status --dest-cluster-file "$g\fdb2.cluster" 2>&1 | Out-String; $rstatus -match '(?i)completed' } 90
+            $rdone = $false
+            for ($i = 0; $i -lt 90; $i++) {
+              $rstatus = & "$g\fdbrestore.exe" status --dest-cluster-file "$g\fdb2.cluster" 2>&1 | Out-String
+              if ($rstatus -match '(?i)state:\s*completed') { $rdone = $true; break }
+              Start-Sleep 1
+            }
             Check '7 fdbrestore status reports completed' $rdone $rstatus
+            Stop-P 'agent2'
             $restored = & "$g\fdbcli.exe" -C "$g\fdb2.cluster" --timeout 20 --exec 'get gatekey' 2>&1 | Out-String
             Check '7 restored key matches' ($restored -match 'gatevalue') $restored
             Check '7 control: backup dest is separate from the live cluster, not the FDB under test' (Test-Path "$g\backupdest") "dest=$dest"
@@ -290,7 +328,7 @@ jobs:
           }
           $failed = @($results.Keys | Where-Object { -not $results[$_] }).Count
           "checks: $($results.Count), failed: $failed"
-          if ($results.Count -lt 23 -or $failed -gt 0) { exit 1 }
+          if ($results.Count -lt 24 -or $failed -gt 0) { exit 1 }
           exit 0
 
       - if: always()
