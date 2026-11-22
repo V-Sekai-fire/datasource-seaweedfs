@@ -1,0 +1,19 @@
+# Baseline hygiene: these hooks report and never rewrite files.
+# Lockfiles, fixtures, binary formats and vendored trees are excluded
+# because fixtures are compared byte for byte.
+exclude: '(^|/)(vendor|third_party|thirdparty|build)/|\.(lock|usd[a-z]?|parquet|svg|png|jpe?g|webp|lean|glb|gltf|ppm|bin)$|(^|/)package-lock\.json$'
+repos:
+  - repo: builtin
+    hooks:
+      - id: check-merge-conflict
+        args: [--assume-in-merge]
+      - id: check-case-conflict
+      - id: check-added-large-files
+        args: [--maxkb=1024]
+      - id: detect-private-key
+        exclude: '^seaweed\-volume/src/main\.rs$|^seaweed\-volume/src/server/grpc_client\.rs$|^seaweed\-worker/crates/lance/src/tls\.rs$|^telemetry/DEPLOYMENT\.md$|^unmaintained/local\-nginx/key\.pem$|^weed/server/volume_grpc_remote_test\.go$'
+      - id: check-yaml
+        exclude: '^k8s/charts/seaweedfs/templates/admin/|^k8s/charts/seaweedfs/templates/all\-in\-one/|^k8s/charts/seaweedfs/templates/cert/|^k8s/charts/seaweedfs/templates/cosi/|^k8s/charts/seaweedfs/templates/filer/|^k8s/charts/seaweedfs/templates/master/|^k8s/charts/seaweedfs/templates/s3/|^k8s/charts/seaweedfs/templates/sftp/|^k8s/charts/seaweedfs/templates/shared/|^k8s/charts/seaweedfs/templates/volume/|^k8s/charts/seaweedfs/templates/worker/worker\-deployment\.yaml$|^k8s/charts/seaweedfs/templates/worker/worker\-service\.yaml$|^k8s/charts/seaweedfs/templates/worker/worker\-servicemonitor\.yaml$'
+      - id: check-toml
+      - id: check-json
+      - id: check-xml
